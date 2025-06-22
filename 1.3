@@ -1,0 +1,595 @@
+#include <EEPROM.h>
+
+#define EEPROM_SIZE 512
+#define TOKEN_SIZE 13   // max token length + null terminator
+
+#define FAT_SIZE 10
+#define FAT_START 0
+#define FAT_ENTRY_BYTE_SIZE (TOKEN_SIZE + sizeof(int) + sizeof(int)) // 13 + 4 + 4 = 21 bytes per entry
+#define FILE_DATA_START (FAT_START + FAT_SIZE * FAT_ENTRY_BYTE_SIZE + 1) // After FAT entries and the noOfFilesCount byte
+
+// --- GLOBAL DECLARATIONS (MUST BE AT THE TOP) ---
+
+// Structs
+struct Process {
+  int pid;
+  String name;
+  int pc;       // program counter
+  int sp;       // stack pointer
+  int fp;       // file pointer
+  int loopStart;
+  String status; // "running", "paused", "stopped"
+  byte stack[32];
+};
+
+struct Variable {
+  String name;
+  String type;
+  int address;
+  int size;
+  int processID;
+};
+
+// Note: We will no longer directly use sizeof(FileEntry) for EEPROM offsets
+// We will manually manage the byte layout.
+struct FileEntry {
+  char name[TOKEN_SIZE]; // 13 bytes
+  int startAddress;      // 4 bytes
+  int length;            // 4 bytes
+};
+
+
+// Global variable for number of files in RAM
+// This will be read from EEPROM at setup and written back when changed.
+byte noOfFilesCount; 
+
+// Global buffers for command parsing
+static char inputBuffer[TOKEN_SIZE];   // buffer for current token
+static uint8_t bufferIndex = 0;        // index in the buffer
+#define MAX_TOKENS 10
+char tokens[MAX_TOKENS][TOKEN_SIZE];
+uint8_t tokenCount = 0;
+bool commandReady = false;
+
+// --- FORWARD DECLARATIONS (for functions that call each other) ---
+// File System
+bool createFile(String name, byte* data, int length);
+bool readFile(String name, byte* buffer, int maxLength);
+bool deleteFile(String name);
+int getFreeSpace();
+void listFiles();
+int findFATEntry(const char* name); 
+void writeFATEntry(int index, FileEntry entry); 
+FileEntry readFATEntry(int index); 
+
+// Helper functions for EEPROM count
+byte getNoOfFilesFromEEPROM();
+void setNoOfFilesToEEPROM(byte count);
+
+// Memory Management (placeholders - still need implementation)
+bool storeVariable(String name, String type, void* value, int processID);
+bool readVariable(String name, void* outValue);
+bool deleteVariablesOfProcess(int processID);
+
+// Process Management (placeholders - still need implementation)
+int startProcess(String filename);
+void pauseProcess(int pid);
+void resumeProcess(int pid);
+void killProcess(int pid);
+void runProcesses();
+
+// Stack (placeholders - still need implementation)
+bool pushByte(int pid, byte value);
+bool popByte(int pid, byte* out);
+bool pushInt(int pid, int value);
+bool popInt(int pid, int* out);
+
+// Interpreter (placeholder)
+void executeInstruction(int pid);
+
+// CLI Command Handlers - ALL FORWARD DECLARATIONS HERE
+void cmdRun(char tokens[][TOKEN_SIZE], uint8_t tokenCount);
+void cmdKill(char tokens[][TOKEN_SIZE], uint8_t tokenCount);
+void cmdMemFree(char tokens[][TOKEN_SIZE], uint8_t tokenCount);
+void cmdLs(char tokens[][TOKEN_SIZE], uint8_t tokenCount);
+void cmdReadFile(char tokens[][TOKEN_SIZE], uint8_t tokenCount);
+void cmdSTORE(char tokens[][TOKEN_SIZE], uint8_t tokenCount);
+void cmdDeleteFile(char tokens[][TOKEN_SIZE], uint8_t tokenCount); // <--- CORRECTLY DECLARED HERE
+void cmdUnknown(char tokens[][TOKEN_SIZE], uint8_t tokenCount); // <--- CORRECTLY DECLARED HERE
+
+// Command struct: name + pointer to handler function
+typedef void (*CmdFunc)(char tokens[][TOKEN_SIZE], uint8_t tokenCount);
+
+typedef struct {
+  char name[TOKEN_SIZE];
+  CmdFunc func;
+} commandType;
+
+// List of commands:
+static commandType commands[] = {
+  {"run", cmdRun},
+  {"kill", cmdKill},
+  {"memfree", cmdMemFree},
+  {"ls", cmdLs},
+  {"readfile", cmdReadFile},
+  {"STORE", cmdSTORE},
+  {"deletefile", cmdDeleteFile}, // <--- THIS LINE IS CORRECT, REFERS TO DECLARATION ABOVE
+  // add more commands here
+};
+
+static int nCommands = sizeof(commands) / sizeof(commandType);
+
+// Helper
+void printPrompt();
+bool readTokenNonBlocking();
+
+
+// --- FILE SYSTEM IMPLEMENTATIONS ---
+
+// Helper function to read the noOfFilesCount from EEPROM
+byte getNoOfFilesFromEEPROM() {
+    byte count;
+    // Check if EEPROM.get is successful, otherwise return 0 (initial state)
+    EEPROM.get(FAT_START + FAT_SIZE * FAT_ENTRY_BYTE_SIZE, count); 
+    return count;
+}
+
+// Helper function to write the noOfFilesCount to EEPROM
+void setNoOfFilesToEEPROM(byte count) {
+    EEPROM.put(FAT_START + FAT_SIZE * FAT_ENTRY_BYTE_SIZE, count); 
+    EEPROM.commit(); // Commit immediately after updating the count
+}
+
+// Function to calculate the base address for a specific FAT entry
+int getFATEntryBaseAddress(int index) {
+  return FAT_START + index * FAT_ENTRY_BYTE_SIZE;
+}
+
+void writeFATEntry(int index, FileEntry entry) {
+  int baseAddr = getFATEntryBaseAddress(index);
+  int offset = 0;
+
+  // Write name (char array) byte by byte
+  for (int i = 0; i < TOKEN_SIZE; i++) {
+    EEPROM.write(baseAddr + offset + i, entry.name[i]);
+  }
+  offset += TOKEN_SIZE;
+
+  // Write startAddress (int)
+  EEPROM.put(baseAddr + offset, entry.startAddress);
+  offset += sizeof(int);
+
+  // Write length (int)
+  EEPROM.put(baseAddr + offset, entry.length);
+
+  EEPROM.commit(); // Ensure changes are written
+}
+
+FileEntry readFATEntry(int index) {
+  FileEntry entry;
+  int baseAddr = getFATEntryBaseAddress(index);
+  int offset = 0;
+
+  // Read name (char array) byte by byte
+  for (int i = 0; i < TOKEN_SIZE; i++) {
+    entry.name[i] = EEPROM.read(baseAddr + offset + i);
+  }
+  offset += TOKEN_SIZE;
+
+  // Read startAddress (int)
+  EEPROM.get(baseAddr + offset, entry.startAddress);
+  offset += sizeof(int);
+
+  // Read length (int)
+  EEPROM.get(baseAddr + offset, entry.length);
+
+  return entry;
+}
+
+
+int findFATEntry(const char* name) {
+  FileEntry entry;
+  for (int i = 0; i < noOfFilesCount; i++) { 
+    entry = readFATEntry(i); 
+    if (strncmp(entry.name, name, TOKEN_SIZE) == 0) { 
+      return i;
+    }
+  }
+  return -1;
+}
+
+
+bool createFile(String name, byte* data, int length) {
+  if (noOfFilesCount >= FAT_SIZE) { 
+    Serial.println("FAT is full");
+    return false;
+  }
+
+  if (findFATEntry(name.c_str()) != -1) {
+    Serial.println("File already exists");
+    return false;
+  }
+
+  // Read existing entries and sort by startAddress
+  FileEntry entries[FAT_SIZE];
+  for (int i = 0; i < noOfFilesCount; i++) { 
+    entries[i] = readFATEntry(i);
+  }
+
+  // Sort by startAddress (Bubble Sort - can be optimized for larger FATs)
+  for (int i = 0; i < noOfFilesCount - 1; i++) { 
+    for (int j = i + 1; j < noOfFilesCount; j++) { 
+      if (entries[i].startAddress > entries[j].startAddress) {
+        FileEntry temp = entries[i];
+        entries[i] = entries[j];
+        entries[j] = temp;
+      }
+    }
+  }
+
+  // Find suitable space
+  int start = FILE_DATA_START;
+  for (int i = 0; i < noOfFilesCount; i++) { 
+    if (entries[i].startAddress - start >= length) {
+      break; // Found a gap
+    }
+    start = entries[i].startAddress + entries[i].length;
+  }
+  
+  // Check if there's enough space after the last file as well
+  if ((long)start + length > EEPROM_SIZE) { // Cast to long to prevent overflow
+    Serial.println("Not enough space");
+    return false;
+  }
+  
+
+  // Create FAT-entry
+  FileEntry newEntry;
+  strncpy(newEntry.name, name.c_str(), TOKEN_SIZE -1); // -1 to ensure null termination
+  newEntry.name[TOKEN_SIZE -1] = '\0'; // Ensure null termination
+  newEntry.startAddress = start;
+  newEntry.length = length;
+
+  writeFATEntry(noOfFilesCount, newEntry); 
+  noOfFilesCount++; 
+  setNoOfFilesToEEPROM(noOfFilesCount); 
+
+  // Write data
+  for (int i = 0; i < length; i++) {
+    EEPROM.write(start + i, data[i]); 
+  }
+  EEPROM.commit(); // Commit data changes
+
+  Serial.println("File stored successfully");
+  return true;
+}
+
+
+bool readFile(String name, byte* buffer, int maxLength) {
+  int index = findFATEntry(name.c_str());
+  if (index == -1) {
+    Serial.println("File not found");
+    return false;
+  }
+
+  FileEntry entry = readFATEntry(index);
+  int len = min(entry.length, maxLength);
+
+  for (int i = 0; i < len; i++) {
+    buffer[i] = EEPROM.read(entry.startAddress + i); 
+  }
+  buffer[len] = '\0'; // Null-terminate the buffer if reading strings
+
+  return true;
+}
+
+bool deleteFile(String name) {
+  int index = findFATEntry(name.c_str());
+  if (index == -1) {
+    Serial.println("File not found");
+    return false;
+  }
+
+  // Shift subsequent entries up in the FAT
+  for (int i = index; i < noOfFilesCount - 1; i++) { 
+    FileEntry next = readFATEntry(i + 1);
+    writeFATEntry(i, next);
+  }
+  
+  // Clear the last entry that was shifted down (optional, but good practice)
+  FileEntry emptyEntry = {"", 0, 0};
+  writeFATEntry(noOfFilesCount - 1, emptyEntry);
+
+  noOfFilesCount--; 
+  setNoOfFilesToEEPROM(noOfFilesCount); 
+
+  Serial.println("File deleted");
+  return true;
+}
+
+int getFreeSpace() {
+  FileEntry entries[FAT_SIZE];
+  for (int i = 0; i < noOfFilesCount; i++) { 
+    entries[i] = readFATEntry(i);
+  }
+
+  // Sort on startAddress
+  for (int i = 0; i < noOfFilesCount - 1; i++) { 
+    for (int j = i + 1; j < noOfFilesCount; j++) { 
+      if (entries[i].startAddress > entries[j].startAddress) {
+        FileEntry temp = entries[i];
+        entries[i] = entries[j];
+        entries[j] = temp;
+      }
+    }
+  }
+
+  int maxGap = 0;
+  int prevEnd = FILE_DATA_START;
+  for (int i = 0; i < noOfFilesCount; i++) { 
+    int gap = entries[i].startAddress - prevEnd;
+    if (gap > maxGap) maxGap = gap;
+    prevEnd = entries[i].startAddress + entries[i].length;
+  }
+
+  int finalGap = EEPROM_SIZE - prevEnd; 
+  if (finalGap > maxGap) maxGap = finalGap;
+
+  return maxGap;
+}
+
+void listFiles() {
+  Serial.println("Files:");
+  if (noOfFilesCount == 0) { 
+    Serial.println("  No files found.");
+    return;
+  }
+  for (int i = 0; i < noOfFilesCount; i++) { 
+    FileEntry entry = readFATEntry(i);
+    Serial.print("  ");
+    Serial.print(entry.name);
+    Serial.print(" (");
+    Serial.print(entry.length);
+    Serial.println(" bytes)");
+  }
+}
+
+
+// --- PLACEHOLDER IMPLEMENTATIONS for other modules ---
+bool storeVariable(String name, String type, void* value, int processID) {
+  Serial.println("storeVariable() not yet implemented");
+  return false;
+}
+
+bool readVariable(String name, void* outValue) {
+  Serial.println("readVariable() not yet implemented");
+  return false;
+}
+
+bool deleteVariablesOfProcess(int processID) {
+  Serial.println("deleteVariablesOfProcess() not yet implemented");
+  return false;
+}
+
+int startProcess(String filename) {
+  Serial.println("startProcess() not yet implemented");
+  return -1;
+}
+
+void pauseProcess(int pid) {
+  Serial.println("pauseProcess() not yet implemented");
+}
+
+void resumeProcess(int pid) {
+  Serial.println("resumeProcess() not yet implemented");
+}
+
+void killProcess(int pid) {
+  Serial.println("killProcess() not yet implemented");
+}
+
+void runProcesses() {
+  // This function would typically iterate through active processes and call executeInstruction
+  Serial.println("runProcesses() not yet implemented (no active processes to run)");
+}
+
+bool pushByte(int pid, byte value) {
+  Serial.println("pushByte() not yet implemented");
+  return false;
+}
+
+bool popByte(int pid, byte* out) {
+  Serial.println("popByte() not yet implemented");
+  return false;
+}
+
+bool pushInt(int pid, int value) {
+  Serial.println("pushInt() not yet implemented");
+  return false;
+}
+
+bool popInt(int pid, int* out) {
+  Serial.println("popInt() not yet implemented");
+  return false;
+}
+
+void executeInstruction(int pid) {
+  Serial.println("executeInstruction() not yet implemented");
+}
+
+
+// --- CLI COMMAND HANDLER IMPLEMENTATIONS ---
+
+void cmdRun(char tokens[][TOKEN_SIZE], uint8_t tokenCount) {
+  if (tokenCount >= 2) {
+    startProcess(String(tokens[1]));
+  } else {
+    Serial.println("Error: 'run' requires filename");
+  }
+}
+
+void cmdKill(char tokens[][TOKEN_SIZE], uint8_t tokenCount) {
+  if (tokenCount >= 2) {
+    int pid = atoi(tokens[1]);
+    killProcess(pid);
+  } else {
+    Serial.println("Error: 'kill' requires pid");
+  }
+}
+
+void cmdMemFree(char tokens[][TOKEN_SIZE], uint8_t tokenCount) {
+  Serial.print("Free memory: ");
+  Serial.print(getFreeSpace());
+  Serial.println(" bytes");
+}
+
+void cmdLs(char tokens[][TOKEN_SIZE], uint8_t tokenCount) {
+  listFiles();
+}
+
+void cmdReadFile(char tokens[][TOKEN_SIZE], uint8_t tokenCount) {
+  if (tokenCount >= 2) {
+    byte buffer[257]; // +1 for null terminator for string data
+    if (readFile(String(tokens[1]), buffer, 256)) {
+      Serial.print("Content of '");
+      Serial.print(tokens[1]);
+      Serial.print("': ");
+      Serial.println((char*)buffer);
+    }
+  } else {
+    Serial.println("Error: 'readfile' requires filename");
+  }
+}
+
+void cmdWriteFile(char tokens[][TOKEN_SIZE], uint8_t tokenCount) {
+  if (tokenCount >= 3) {
+    String data = "";
+    // Reconstruct data string from remaining tokens
+    for (int i = 2; i < tokenCount; i++) {
+      data += tokens[i];
+      if (i < tokenCount - 1) data += " ";
+    }
+    createFile(String(tokens[1]), (byte*)data.c_str(), data.length() + 1); // +1 for null terminator
+  } else {
+    Serial.println("Error: 'writefile' requires filename and data");
+  }
+}
+
+void cmdDeleteFile(char tokens[][TOKEN_SIZE], uint8_t tokenCount) { 
+  if (tokenCount >= 2) {
+    deleteFile(String(tokens[1]));
+  } else {
+    Serial.println("Error: 'deletefile' requires filename");
+  }
+}
+
+// THIS IS THE ONLY cmdUnknown DEFINITION YOU SHOULD HAVE
+void cmdUnknown(char tokens[][TOKEN_SIZE], uint8_t tokenCount) { 
+  Serial.println("Unknown command.");
+}
+
+
+// --- SERIAL INPUT HANDLING ---
+
+// Helper: print prompt
+void printPrompt() {
+  Serial.print("ArduinOS> ");
+}
+
+// Reads chars from Serial and accumulates tokens separated by space or newline
+// Returns true when a full command (ended by newline) is ready to process
+bool readTokenNonBlocking() {
+  while (Serial.available() > 0) {
+    char ch = Serial.read();
+
+    // Echo character back so user sees what they type
+    Serial.write(ch);
+
+    if (ch == ' ' || ch == '\n' || ch == '\r') { // Also handle carriage return
+      // End of a token
+      inputBuffer[bufferIndex] = '\0';  // null terminate
+
+      if (bufferIndex > 0) {  // avoid empty tokens from multiple spaces or newlines
+        // Copy token into tokens array if space available
+        if (tokenCount < MAX_TOKENS) {
+          strncpy(tokens[tokenCount], inputBuffer, TOKEN_SIZE - 1); // -1 to ensure null termination space
+          tokens[tokenCount][TOKEN_SIZE - 1] = '\0'; // Ensure null termination
+          tokenCount++;
+        }
+      }
+
+      bufferIndex = 0;  // reset buffer for next token
+
+      if (ch == '\n' || ch == '\r') { // Command ends on newline or carriage return
+        commandReady = true;
+        return true;  // full command ready
+      }
+
+      // If space, continue reading next token
+    } else {
+      // Add character to input buffer if room
+      if (bufferIndex < TOKEN_SIZE - 1) { // Leave space for null terminator
+        inputBuffer[bufferIndex++] = ch;
+      }
+      // else ignore extra characters if token too long
+    }
+  }
+  return false;  // no full command yet
+}
+
+
+// --- SETUP AND LOOP ---
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize EEPROM with the defined size
+  if (!EEPROM.begin(EEPROM_SIZE)) {
+    Serial.println("EEPROM init failed! Please check board type and EEPROM support.");
+    while (true); // Halt if EEPROM fails
+  } else {
+    Serial.println("EEPROM initialized.");
+  }
+
+  // --- ADD THIS LINE TEMPORARILY FOR A FRESH START ---
+  // for (int i = 0; i < EEPROM_SIZE; i++) EEPROM.write(i, 0); EEPROM.commit();
+  // --- REMEMBER TO REMOVE OR COMMENT IT OUT AFTER ONE SUCCESSFUL BOOT ---
+  // Read the number of files from EEPROM into our RAM variable
+  noOfFilesCount = getNoOfFilesFromEEPROM();
+
+  // Initialize file system counter if it's corrupt
+  if (noOfFilesCount > FAT_SIZE) { // Check if the stored count exceeds the FAT capacity
+    Serial.println("FAT count corrupted. Resetting file count to 0.");
+    noOfFilesCount = 0; // Reset corrupted value in RAM
+    setNoOfFilesToEEPROM(noOfFilesCount); // Persist the reset to EEPROM
+  }
+
+  Serial.println("ArduinOS 1.0 ready");
+  printPrompt();
+}
+
+void loop() {
+  // Check for new commands from serial input
+  if (readTokenNonBlocking()) {
+    if (tokenCount > 0) {
+      // Look up command in the table
+      bool found = false;
+      for (int i = 0; i < nCommands; i++) {
+        if (strcmp(tokens[0], commands[i].name) == 0) {
+          commands[i].func(tokens, tokenCount);
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        cmdUnknown(tokens, tokenCount); // Call the single cmdUnknown function
+      }
+    }
+
+    // Reset for next command
+    tokenCount = 0;
+    bufferIndex = 0; // Clear input buffer as well
+    commandReady = false;
+    printPrompt();
+  }
+}
