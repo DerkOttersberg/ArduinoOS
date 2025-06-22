@@ -1,0 +1,341 @@
+#include <EEPROM.h>
+
+#define EEPROM_SIZE 512 
+#define TOKEN_SIZE 13  // max token length + null terminator
+
+
+
+// Bestandssysteem
+bool createFile(String name, byte* data, int length);
+bool readFile(String name, byte* buffer, int maxLength);
+bool deleteFile(String name);
+int getFreeSpace();
+void listFiles();
+
+// Geheugenbeheer
+bool storeVariable(String name, String type, void* value, int processID);
+bool readVariable(String name, void* outValue);
+bool deleteVariablesOfProcess(int processID);
+
+// Procesbeheer
+int startProcess(String filename);
+void pauseProcess(int pid);
+void resumeProcess(int pid);
+void killProcess(int pid);
+void runProcesses();
+
+// Stack
+bool pushByte(int pid, byte value);
+bool popByte(int pid, byte* out);
+bool pushInt(int pid, int value);
+bool popInt(int pid, int* out);
+
+// Interpreter
+void executeInstruction(int pid);
+
+// Helper
+String nextToken(String& input);
+
+
+struct Process {
+  int pid;
+  String name;
+  int pc;       // program counter
+  int sp;       // stack pointer
+  int fp;       // file pointer
+  int loopStart;
+  String status; // "running", "paused", "stopped"
+  byte stack[32];
+};
+
+
+struct Variable {
+  String name;
+  String type;
+  int address;
+  int size;
+  int processID;
+};
+
+
+
+struct FileEntry {
+  char name[13]; // max 12 + '\0'
+  int startAddress;
+  int length;
+};
+
+
+static char inputBuffer[TOKEN_SIZE];  // buffer for current token
+static uint8_t bufferIndex = 0;       // index in the buffer
+
+#define MAX_TOKENS 10
+char tokens[MAX_TOKENS][TOKEN_SIZE];
+uint8_t tokenCount = 0;
+bool commandReady = false;
+
+// Forward declare command functions:
+void cmdRun(char tokens[][TOKEN_SIZE], uint8_t tokenCount);
+void cmdKill(char tokens[][TOKEN_SIZE], uint8_t tokenCount);
+void cmdMemFree(char tokens[][TOKEN_SIZE], uint8_t tokenCount);
+void cmdLs(char tokens[][TOKEN_SIZE], uint8_t tokenCount);
+void cmdReadFile(char tokens[][TOKEN_SIZE], uint8_t tokenCount);
+void cmdWriteFile(char tokens[][TOKEN_SIZE], uint8_t tokenCount);
+void cmdUnknown(char tokens[][TOKEN_SIZE], uint8_t tokenCount);
+
+// Command struct: name + pointer to handler function
+typedef void (*CmdFunc)(char tokens[][TOKEN_SIZE], uint8_t tokenCount);
+
+typedef struct {
+  char name[TOKEN_SIZE];
+  CmdFunc func;
+} commandType;
+
+// List of commands:
+static commandType commands[] = {
+  {"run", cmdRun},
+  {"kill", cmdKill},
+  {"memfree", cmdMemFree},
+  {"ls", cmdLs},
+  {"readfile", cmdReadFile},
+  {"writefile", cmdWriteFile},
+  // add more commands here
+};
+
+static int nCommands = sizeof(commands) / sizeof(commandType);
+
+// Your methods declarations here (unchanged)
+// ...
+
+// Helper: print prompt
+void printPrompt() {
+  Serial.print("ArduinOS> ");
+}
+
+// Implementations of your command handlers:
+
+void cmdRun(char tokens[][TOKEN_SIZE], uint8_t tokenCount) {
+  if (tokenCount >= 2) {
+    startProcess(String(tokens[1]));
+  } else {
+    Serial.println("Error: 'run' requires filename");
+  }
+}
+
+void cmdKill(char tokens[][TOKEN_SIZE], uint8_t tokenCount) {
+  if (tokenCount >= 2) {
+    int pid = atoi(tokens[1]);
+    killProcess(pid);
+  } else {
+    Serial.println("Error: 'kill' requires pid");
+  }
+}
+
+void cmdMemFree(char tokens[][TOKEN_SIZE], uint8_t tokenCount) {
+  Serial.print("Free memory: ");
+  Serial.print(getFreeSpace());
+  Serial.println(" bytes");
+}
+
+void cmdLs(char tokens[][TOKEN_SIZE], uint8_t tokenCount) {
+  listFiles();
+}
+
+void cmdReadFile(char tokens[][TOKEN_SIZE], uint8_t tokenCount) {
+  if (tokenCount >= 2) {
+    byte buffer[256];
+    if (readFile(String(tokens[1]), buffer, 256)) {
+      Serial.println((char*)buffer);
+    }
+  } else {
+    Serial.println("Error: 'readfile' requires filename");
+  }
+}
+
+void cmdWriteFile(char tokens[][TOKEN_SIZE], uint8_t tokenCount) {
+  if (tokenCount >= 3) {
+    String data = "";
+    for (int i = 2; i < tokenCount; i++) {
+      data += tokens[i];
+      if (i < tokenCount - 1) data += " ";
+    }
+    createFile(String(tokens[1]), (byte*)data.c_str(), data.length() + 1);
+  } else {
+    Serial.println("Error: 'writefile' requires filename and data");
+  }
+}
+
+void cmdUnknown(char tokens[][TOKEN_SIZE], uint8_t tokenCount) {
+  Serial.println("Unknown command.");
+}
+
+// Reads chars from Serial and accumulates tokens separated by space or newline
+// Returns true when a full command (ended by newline) is ready to process
+bool readTokenNonBlocking() {
+  while (Serial.available() > 0) {
+    char ch = Serial.read();
+
+    // Echo character back so user sees what they type
+    Serial.write(ch);
+
+    if (ch == ' ' || ch == '\n') {
+      // End of a token
+      inputBuffer[bufferIndex] = '\0';  // null terminate
+
+      if (bufferIndex > 0) {  // avoid empty tokens
+        // Copy token into tokens array if space available
+        if (tokenCount < MAX_TOKENS) {
+          strncpy(tokens[tokenCount], inputBuffer, TOKEN_SIZE);
+          tokenCount++;
+        }
+      }
+
+      bufferIndex = 0;  // reset buffer for next token
+
+      if (ch == '\n') {
+        commandReady = true;
+        return true;  // full command ready
+      }
+
+      // If space, continue reading next token
+    } else {
+      // Add character to input buffer if room
+      if (bufferIndex < TOKEN_SIZE - 1) {
+        inputBuffer[bufferIndex++] = ch;
+      }
+      // else ignore extra characters
+    }
+  }
+  return false;  // no full command yet
+}
+
+
+
+
+
+void handleCommand(String input) {
+  input.trim();
+  String command = nextToken(input);
+
+  if (command == "run") {
+    String filename = nextToken(input);
+    startProcess(filename);
+  } else if (command == "kill") {
+    int pid = nextToken(input).toInt();
+    killProcess(pid);
+  } else if (command == "memfree") {
+    Serial.println("Free memory: " + String(getFreeSpace()) + " bytes");
+  } else if (command == "ls") {
+    listFiles();
+  } else if (command == "readfile") {
+    String name = nextToken(input);
+    byte buffer[256];
+    readFile(name, buffer, 256);
+    Serial.println((char*)buffer);
+  } else if (command == "writefile") {
+    String name = nextToken(input);
+    String data = input; // rest van de input is data
+    createFile(name, (byte*)data.c_str(), data.length() + 1);
+  } else {
+    Serial.println("Unknown command.");
+  }
+}
+
+String nextToken(String& input) {
+  input.trim();
+  int index = input.indexOf(' ');
+  if (index == -1) {
+    String token = input;
+    input = "";
+    return token;
+  }
+  String token = input.substring(0, index);
+  input = input.substring(index + 1);
+  return token;
+}
+
+
+
+bool createFile(String name, byte* data, int length) {
+  // Example implementation using EEPROM as a fake file system
+  // You should keep track of file entries and their data
+  Serial.println("createFile() not yet implemented");
+  return false;
+}
+
+bool readFile(String name, byte* buffer, int maxLength) {
+  Serial.println("readFile() not yet implemented");
+  return false;
+}
+
+bool deleteFile(String name) {
+  Serial.println("deleteFile() not yet implemented");
+  return false;
+}
+
+int getFreeSpace() {
+  return EEPROM_SIZE;  // For now, pretend it's fully free
+}
+
+void listFiles() {
+  Serial.println("listFiles() not yet implemented");
+}
+
+int startProcess(String filename) {
+  Serial.println("startProcess() not yet implemented");
+  return -1;
+}
+
+void killProcess(int pid) {
+  Serial.println("killProcess() not yet implemented");
+}
+
+
+
+
+//einde methods
+
+
+
+
+
+void setup() {
+  Serial.begin(115200);
+
+  if (!EEPROM.begin(EEPROM_SIZE)) {
+    Serial.println("EEPROM init failed!");
+    while (1);
+  } else {
+    Serial.println("EEPROM initialized.");
+  }
+
+  Serial.println("ArduinOS 1.0 ready");
+  printPrompt();
+}
+
+
+String inputLine = "";
+
+void loop() {
+  if (readTokenNonBlocking()) {
+    if (tokenCount > 0) {
+      // Look up command in the table
+      bool found = false;
+      for (int i = 0; i < nCommands; i++) {
+        if (strcmp(tokens[0], commands[i].name) == 0) {
+          commands[i].func(tokens, tokenCount);
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        cmdUnknown(tokens, tokenCount);
+      }
+    }
+
+    // Reset for next command
+    tokenCount = 0;
+    commandReady = false;
+    printPrompt();
+  }
+}
